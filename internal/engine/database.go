@@ -13,19 +13,22 @@ import (
 )
 
 type DB struct {
-	mu           sync.RWMutex
-	dir          string
-	catalog      *catalog.Catalog
-	store        *versions.Store
-	indexes      *index.Registry
-	wal          *journal.WAL
-	sequence     uint64
-	horizon      uint64
-	transactions map[string]*Transaction
-	closed       bool
-	commits      uint64
-	conflicts    uint64
-	queries      uint64
+	mu                  sync.RWMutex
+	dir                 string
+	catalog             *catalog.Catalog
+	store               *versions.Store
+	indexes             *index.Registry
+	wal                 *journal.WAL
+	sequence            uint64
+	horizon             uint64
+	transactions        map[string]*Transaction
+	closed              bool
+	commits             uint64
+	conflicts           uint64
+	queries             uint64
+	checkpoint          *checkpointFlight
+	checkpointPublished uint64
+	checkpointError     string
 }
 
 func Open(dir string) (*DB, error) {
@@ -53,6 +56,7 @@ func Open(dir string) (*DB, error) {
 		d.store = image.Store
 		d.sequence = image.Sequence
 		d.horizon = image.Horizon
+		d.checkpointPublished = image.Sequence
 	}
 	last := w.Base + uint64(len(w.Records))
 	if d.sequence > last {
@@ -88,12 +92,20 @@ func (d *DB) usable() error {
 }
 func (d *DB) Close() error {
 	d.mu.Lock()
-	defer d.mu.Unlock()
 	if d.closed {
+		d.mu.Unlock()
 		return nil
 	}
 	d.closed = true
 	d.transactions = map[string]*Transaction{}
+	flight := d.checkpoint
+	d.mu.Unlock()
+	if flight != nil {
+		// An in-flight checkpoint does not need the lock to finish its file
+		// operations; wait so no goroutine touches the data directory after
+		// Close returns. The installed image stays valid for the next open.
+		<-flight.done
+	}
 	return d.wal.Close()
 }
 func (d *DB) publish(r journal.Record) error {

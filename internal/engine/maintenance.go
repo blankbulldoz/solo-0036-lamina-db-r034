@@ -8,29 +8,77 @@ import (
 	"lamina/internal/versions"
 	"os"
 	"path/filepath"
+	"sync/atomic"
+	"time"
 )
 
-func (d *DB) image() snapshot.Image {
-	return snapshot.Image{Format: 1, Sequence: d.sequence, Horizon: d.horizon, Catalog: d.catalog.Clone(), Store: d.store.Clone()}
+// checkpointFlight tracks one in-flight image write. Sequence and started are
+// fixed at capture; err is assigned before done is closed, so coalesced
+// requests that observe done may read the result without further locking.
+type checkpointFlight struct {
+	sequence uint64
+	started  time.Time
+	done     chan struct{}
+	shared   atomic.Int32
+	err      error
 }
+
+// capture freezes the current committed position with a structural share: the
+// catalog is cloned and the store's maps are copied, but version chains are
+// shared with the live store. Chains are append-only, vacuum replaces them
+// copy-on-write, and stored rows are immutable, so the image stays consistent
+// while commits and vacuum proceed; versions it references stay pinned until
+// the image is dropped. Callers must hold d.mu.
+func (d *DB) capture() snapshot.Image {
+	return snapshot.Image{Format: 1, Sequence: d.sequence, Horizon: d.horizon, Catalog: d.catalog.Clone(), Store: d.store.Share()}
+}
+
+// Checkpoint installs a durable image of one committed position. Only the
+// capture runs under the database lock; encoding and the durable install run
+// outside it, so commits and queries continue while the image is written. A
+// single write is in flight at a time: concurrent requests coalesce onto it
+// and receive the same captured position instead of copying state or queueing
+// a second image. A failed write keeps the previously installed image and
+// does not affect the database.
 func (d *DB) Checkpoint() (uint64, error) {
 	d.mu.Lock()
-	defer d.mu.Unlock()
 	if err := d.usable(); err != nil {
+		d.mu.Unlock()
 		return 0, err
 	}
-	if err := snapshot.Write(filepath.Join(d.dir, "checkpoint.lmi"), d.image()); err != nil {
-		return 0, fault("unavailable", "checkpoint: %s", err)
+	if flight := d.checkpoint; flight != nil {
+		flight.shared.Add(1)
+		d.mu.Unlock()
+		<-flight.done
+		return flight.sequence, flight.err
 	}
-	return d.sequence, nil
+	flight := &checkpointFlight{sequence: d.sequence, started: time.Now().UTC(), done: make(chan struct{})}
+	d.checkpoint = flight
+	image := d.capture()
+	d.mu.Unlock()
+	err := snapshot.Write(filepath.Join(d.dir, "checkpoint.lmi"), image)
+	d.mu.Lock()
+	d.checkpoint = nil
+	if err != nil {
+		d.checkpointError = err.Error()
+		flight.err = fault("unavailable", "checkpoint: %s", err)
+	} else {
+		d.checkpointPublished = flight.sequence
+		d.checkpointError = ""
+	}
+	close(flight.done)
+	d.mu.Unlock()
+	return flight.sequence, flight.err
 }
 func (d *DB) Backup() ([]byte, error) {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
+	d.mu.Lock()
 	if err := d.usable(); err != nil {
+		d.mu.Unlock()
 		return nil, err
 	}
-	b, err := snapshot.Encode(d.image())
+	image := d.capture()
+	d.mu.Unlock()
+	b, err := snapshot.Encode(image)
 	if err != nil {
 		return nil, err
 	}

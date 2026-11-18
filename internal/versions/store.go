@@ -65,6 +65,23 @@ func (s *Store) Scan(table string, at uint64) map[string]datum.Row {
 	}
 	return out
 }
+
+// Share copies the store's map structure while sharing every version chain
+// with the receiver. Chains are append-only, Vacuum installs freshly allocated
+// chains instead of editing existing ones, and stored rows are immutable, so
+// the shared store stays consistent while the live store commits and vacuums.
+// Versions referenced here remain pinned until the shared store is dropped.
+func (s *Store) Share() *Store {
+	out := New()
+	for name, rows := range s.Tables {
+		shared := make(map[string][]Version, len(rows))
+		for key, chain := range rows {
+			shared[key] = chain
+		}
+		out.Tables[name] = shared
+	}
+	return out
+}
 func (s *Store) Clone() *Store {
 	out := New()
 	for name, rows := range s.Tables {
